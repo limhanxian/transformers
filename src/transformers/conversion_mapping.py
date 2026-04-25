@@ -144,12 +144,22 @@ def _build_checkpoint_conversion_mapping():
                 target_patterns=r"model.layers.\1.post_attention_layernorm.",
             ),
             WeightRenaming(
-                source_patterns=r"^layers\.(\d+)\.hc_attn_(fn|base|scale)$",
-                target_patterns=r"model.layers.\1.attn_hc.\2",
+                source_patterns=r"^layers\.(\d+)\.hc_attn_fn$", target_patterns=r"model.layers.\1.attn_hc.fn"
             ),
             WeightRenaming(
-                source_patterns=r"^layers\.(\d+)\.hc_ffn_(fn|base|scale)$",
-                target_patterns=r"model.layers.\1.ffn_hc.\2",
+                source_patterns=r"^layers\.(\d+)\.hc_attn_base$", target_patterns=r"model.layers.\1.attn_hc.base"
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.hc_attn_scale$", target_patterns=r"model.layers.\1.attn_hc.scale"
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.hc_ffn_fn$", target_patterns=r"model.layers.\1.ffn_hc.fn"
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.hc_ffn_base$", target_patterns=r"model.layers.\1.ffn_hc.base"
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.hc_ffn_scale$", target_patterns=r"model.layers.\1.ffn_hc.scale"
             ),
             WeightRenaming(
                 source_patterns=r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.",
@@ -170,10 +180,9 @@ def _build_checkpoint_conversion_mapping():
             WeightRenaming(source_patterns=r"^embed\.weight$", target_patterns="model.embed_tokens.weight"),
             WeightRenaming(source_patterns=r"^head\.weight$", target_patterns="lm_head.weight"),
             WeightRenaming(source_patterns=r"^norm\.weight$", target_patterns="model.norm.weight"),
-            WeightRenaming(
-                source_patterns=r"^hc_head_(fn|base|scale)$",
-                target_patterns=r"model.hc_head.hc_\1",
-            ),
+            WeightRenaming(source_patterns=r"^hc_head_fn$", target_patterns="model.hc_head.hc_fn"),
+            WeightRenaming(source_patterns=r"^hc_head_base$", target_patterns="model.hc_head.hc_base"),
+            WeightRenaming(source_patterns=r"^hc_head_scale$", target_patterns="model.hc_head.hc_scale"),
             # Generic FP8 scale rename — applied last so prior renamings have repositioned
             # scales onto their final module path. Experts' scales are then merged below.
             WeightRenaming(

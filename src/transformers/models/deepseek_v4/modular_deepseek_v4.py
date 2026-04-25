@@ -900,7 +900,7 @@ class DeepseekV4PreTrainedModel(MixtralPreTrainedModel):
     _keep_in_fp32_modules_strict = [
         "attn_hc", "ffn_hc"
     ]
-    _keys_to_ignore_on_load_unexpected = [r"model\.mtp\..*"]
+    _keys_to_ignore_on_load_unexpected = [r"(^|\.)mtp\..*"]
     _can_record_outputs = {
         "router_logits": OutputRecorder(DeepseekV4TopKRouter, index=0),
         "hidden_states": DeepseekV4DecoderLayer,

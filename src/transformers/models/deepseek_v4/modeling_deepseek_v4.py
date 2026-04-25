@@ -908,7 +908,7 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         "hc_head.hc_base",
         "hc_head.hc_scale",
     ]
-    _keys_to_ignore_on_load_unexpected = [r"model\.mtp\..*"]
+    _keys_to_ignore_on_load_unexpected = [r"(^|\.)mtp\..*"]
 
     @torch.no_grad()
     def _init_weights(self, module):
