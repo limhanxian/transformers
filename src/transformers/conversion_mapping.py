@@ -107,6 +107,12 @@ def _build_checkpoint_conversion_mapping():
             # nested under ``attn.indexer.compressor.*`` upstream but flattened onto the
             # Indexer module here. FP8 scales arrive as ``.scale`` and need to become
             # ``.weight_scale_inv`` to match :class:`FineGrainedFP8Linear`.
+            #
+            # Apply the FP8 scale rename FIRST: in the upstream layout, only Linear
+            # weight scales end with ``.scale`` (the HC params use ``hc_attn_scale`` /
+            # ``hc_ffn_scale`` / ``hc_head_scale`` — underscore, not dot). Renaming first
+            # avoids clobbering the HC ``.scale`` parameter we synthesise below.
+            WeightRenaming(source_patterns=r"^(.+)\.scale$", target_patterns=r"\1.weight_scale_inv"),
             WeightRenaming(
                 source_patterns=r"^layers\.(\d+)\.attn\.attn_sink$",
                 target_patterns=r"model.layers.\1.self_attn.sinks",
@@ -183,12 +189,6 @@ def _build_checkpoint_conversion_mapping():
             WeightRenaming(source_patterns=r"^hc_head_fn$", target_patterns="model.hc_head.hc_fn"),
             WeightRenaming(source_patterns=r"^hc_head_base$", target_patterns="model.hc_head.hc_base"),
             WeightRenaming(source_patterns=r"^hc_head_scale$", target_patterns="model.hc_head.hc_scale"),
-            # Generic FP8 scale rename — applied last so prior renamings have repositioned
-            # scales onto their final module path. Experts' scales are then merged below.
-            WeightRenaming(
-                source_patterns=r"^(.+)\.scale$",
-                target_patterns=r"\1.weight_scale_inv",
-            ),
             WeightConverter(
                 source_patterns=[
                     "experts.*.w1.weight",
