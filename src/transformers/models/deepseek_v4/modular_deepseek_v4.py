@@ -47,18 +47,27 @@ logger = logging.get_logger(__name__)
 @strict
 class DeepseekV4Config(DeepseekV3Config):
     r"""
-    compress_ratios (`list[int]`): Per-layer compression schedule in ``{0, 4, 128}``.
+    n_group (`int`, *optional*): Unused in V4 (kept for V3 compatibility — MLA expert grouping).
+    first_k_dense_replace (`int`, *optional*): Unused in V4 — every layer is MoE.
+    rope_interleave (`bool`, *optional*, defaults to `True`): Whether to interleave the rotary position embeddings.
+    rope_theta (`float`, *optional*, defaults to 10000.0): RoPE base for the main attention rotary.
+    partial_rotary_factor (`float`, *optional*): Fraction of head dims that get rotated; defaults to ``qk_rope_head_dim / head_dim``.
+    compress_ratios (`list[int]`, *optional*): Per-layer compression schedule in ``{0, 4, 128}``.
         ``0`` = pure local SWA; ``4`` = overlap-window compress + Indexer; ``128`` = disjoint-window compress.
-    compress_rope_theta (`float`): RoPE base for Compressor layers (paired with ``rope_scaling`` for YaRN).
-    hc_mult (`int`): Hyper-Connection stream count (always active).
-    num_hash_layers (`int`): First N layers route via a frozen ``tid2eid[input_ids]`` lookup.
-    scoring_func (`str`): Router activation — ``sqrtsoftplus``, ``softmax``, or ``sigmoid``.
-    swiglu_limit (`float`): Clip routed experts' gate/up pre-activations.
-    sliding_window (`int`): Local window size used on every layer.
-    o_groups (`int`), o_lora_rank (`int`): Grouped low-rank output projection.
-    index_n_heads, index_head_dim, index_topk (`int`): Indexer hyperparameters.
-    hc_sinkhorn_iters (`int`), hc_eps (`float`): Sinkhorn normalisation knobs.
-    num_nextn_predict_layers (`int`): MTP layer count in the upstream checkpoint (not instantiated here).
+    compress_rope_theta (`float`, *optional*, defaults to 160000.0): RoPE base for Compressor layers (paired with ``rope_scaling`` for YaRN).
+    hc_mult (`int`, *optional*, defaults to 4): Hyper-Connection stream count (always active).
+    num_hash_layers (`int`, *optional*, defaults to 3): First N layers route via a frozen ``tid2eid[input_ids]`` lookup.
+    scoring_func (`str`, *optional*, defaults to `"sqrtsoftplus"`): Router activation — ``sqrtsoftplus``, ``softmax``, or ``sigmoid``.
+    swiglu_limit (`float`, *optional*, defaults to 10.0): Clip routed experts' gate/up pre-activations.
+    sliding_window (`int`, *optional*, defaults to 128): Local window size used on every layer.
+    o_groups (`int`, *optional*, defaults to 8): Number of groups for the low-rank output projection.
+    o_lora_rank (`int`, *optional*, defaults to 1024): Per-group LoRA rank for the output projection.
+    index_n_heads (`int`, *optional*, defaults to 64): Number of heads in the Indexer query.
+    index_head_dim (`int`, *optional*, defaults to 128): Per-head dim of the Indexer query/key.
+    index_topk (`int`, *optional*, defaults to 512): Top-k pooled positions kept by the Indexer.
+    hc_sinkhorn_iters (`int`, *optional*, defaults to 20): Sinkhorn iterations for HC mixer normalisation.
+    hc_eps (`float`, *optional*, defaults to 1e-6): Numerical epsilon for the Sinkhorn normalisation.
+    num_nextn_predict_layers (`int`, *optional*, defaults to 1): MTP layer count in the upstream checkpoint (not instantiated here).
     compress_rope_parameters (`dict`, *optional*): Filled in ``__post_init__``.
     """
 
@@ -98,11 +107,11 @@ class DeepseekV4Config(DeepseekV3Config):
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 1.5
     max_position_embeddings: int = 1048576
-    rope_theta: float = 10000.0
+    rope_theta: float | int = 10000.0
 
     # V4-specific.
     compress_ratios: list[int] | None = None
-    compress_rope_theta: float = 160000.0
+    compress_rope_theta: float | int = 160000.0
     compress_rope_parameters: dict | None = None
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
