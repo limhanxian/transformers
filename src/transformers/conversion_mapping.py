@@ -800,8 +800,11 @@ def get_model_conversion_mapping(
     if add_legacy:
         weight_conversions.extend(get_checkpoint_conversion_mapping("legacy"))
 
-    # Add the ones from the quantizer as well if provided
+    # Let the quantizer rewrite / augment the conversion pipeline. This is where the
+    # FP8 dequantizer (when ``dequantize=True``) prepends a ``Fp8Dequantize`` op to
+    # every existing converter so that per-block scales are applied *before* any
+    # expert-merge / concat ops flatten the per-expert structure away.
     if hf_quantizer is not None:
-        weight_conversions.extend(hf_quantizer.get_weight_conversions())
+        weight_conversions = hf_quantizer.update_weight_conversions(weight_conversions)
 
     return weight_conversions
