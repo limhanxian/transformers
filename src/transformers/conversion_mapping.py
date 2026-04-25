@@ -98,9 +98,88 @@ def _build_checkpoint_conversion_mapping():
             WeightRenaming(source_patterns=r"layer\.", target_patterns="layers."),
         ],
         "deepseek_v4": [
-            # Checkpoints store the per-site Hyper-Connection params flat on the decoder
-            # layer (``hc_attn_fn`` / ``hc_ffn_*``). The HF module tree wraps them in a
-            # ``DeepseekV4HyperConnection`` submodule per site (``attn_hc`` / ``ffn_hc``).
+            # Upstream checkpoint uses a flatter, V3-style namespace: ``attn`` / ``ffn``
+            # instead of ``self_attn`` / ``mlp``, ``attn_norm`` / ``ffn_norm`` instead of
+            # ``input_layernorm`` / ``post_attention_layernorm``, ``hc_attn_*`` / ``hc_ffn_*``
+            # for the Hyper-Connection params (we wrap them in ``attn_hc`` / ``ffn_hc``
+            # submodules), ``embed`` / ``head`` / bare ``norm`` for the model head, and
+            # ``hc_head_*`` for the final HC collapse. The Indexer's compressor tree is
+            # nested under ``attn.indexer.compressor.*`` upstream but flattened onto the
+            # Indexer module here. FP8 scales arrive as ``.scale`` and need to become
+            # ``.weight_scale_inv`` to match :class:`FineGrainedFP8Linear`.
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn\.attn_sink$",
+                target_patterns=r"model.layers.\1.self_attn.sinks",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn\.indexer\.compressor\.norm\.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.indexer.kv_norm.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn\.indexer\.compressor\.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.indexer.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn\.indexer\.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.indexer.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn\.compressor\.norm\.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.kv_norm.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn\.compressor\.",
+                target_patterns=r"model.layers.\1.self_attn.compressor.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn\.",
+                target_patterns=r"model.layers.\1.self_attn.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.attn_norm\.",
+                target_patterns=r"model.layers.\1.input_layernorm.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.ffn_norm\.",
+                target_patterns=r"model.layers.\1.post_attention_layernorm.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.hc_attn_(fn|base|scale)$",
+                target_patterns=r"model.layers.\1.attn_hc.\2",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.hc_ffn_(fn|base|scale)$",
+                target_patterns=r"model.layers.\1.ffn_hc.\2",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.",
+                target_patterns=r"model.layers.\1.mlp.shared_experts.gate_proj.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.ffn\.shared_experts\.w2\.",
+                target_patterns=r"model.layers.\1.mlp.shared_experts.down_proj.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.ffn\.shared_experts\.w3\.",
+                target_patterns=r"model.layers.\1.mlp.shared_experts.up_proj.",
+            ),
+            WeightRenaming(
+                source_patterns=r"^layers\.(\d+)\.ffn\.",
+                target_patterns=r"model.layers.\1.mlp.",
+            ),
+            WeightRenaming(source_patterns=r"^embed\.weight$", target_patterns="model.embed_tokens.weight"),
+            WeightRenaming(source_patterns=r"^head\.weight$", target_patterns="lm_head.weight"),
+            WeightRenaming(source_patterns=r"^norm\.weight$", target_patterns="model.norm.weight"),
+            WeightRenaming(
+                source_patterns=r"^hc_head_(fn|base|scale)$",
+                target_patterns=r"model.hc_head.hc_\1",
+            ),
+            # Generic FP8 scale rename — applied last so prior renamings have repositioned
+            # scales onto their final module path. Experts' scales are then merged below.
+            WeightRenaming(
+                source_patterns=r"^(.+)\.scale$",
+                target_patterns=r"\1.weight_scale_inv",
+            ),
             WeightConverter(
                 source_patterns=[
                     "experts.*.w1.weight",
@@ -114,13 +193,18 @@ def _build_checkpoint_conversion_mapping():
                 target_patterns="experts.down_proj",
                 operations=[MergeModulelist(dim=0)],
             ),
-            WeightRenaming(
-                source_patterns=r"^model\.layers\.(\d+)\.hc_attn_(fn|base|scale)$",
-                target_patterns=r"model.layers.\1.attn_hc.\2",
+            WeightConverter(
+                source_patterns=[
+                    "experts.*.w1.weight_scale_inv",
+                    "experts.*.w3.weight_scale_inv",
+                ],
+                target_patterns="experts.gate_up_proj_scale_inv",
+                operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
             ),
-            WeightRenaming(
-                source_patterns=r"^model\.layers\.(\d+)\.hc_ffn_(fn|base|scale)$",
-                target_patterns=r"model.layers.\1.ffn_hc.\2",
+            WeightConverter(
+                source_patterns="experts.*.w2.weight_scale_inv",
+                target_patterns="experts.down_proj_scale_inv",
+                operations=[MergeModulelist(dim=0)],
             ),
         ],
         "llava": [
