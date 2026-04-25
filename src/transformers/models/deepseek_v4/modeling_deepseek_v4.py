@@ -289,13 +289,41 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 def _apply_partial_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rope_head_dim: int) -> torch.Tensor:
     """Split ``x`` along its last dim into the nope-slice (first dims) and the rope-slice
-    (last ``rope_head_dim`` dims), rotate the rope slice with the standard Llama / GPT-NeoX
-    ``apply_rotary_pos_emb`` (``rotate_half`` + ``cat(freqs, freqs)``-shaped cos/sin), and
-    glue the two back together.
+    (last ``rope_head_dim`` dims), rotate the rope slice, and glue the two back together.
+
+    V4 ships ``rope_interleave=True`` — the rope-slice is laid out as interleaved pairs
+    ``[a0, b0, a1, b1, …]`` (what the upstream complex-number ``apply_rotary_emb`` consumes).
+    We reuse Llama's half-rotation primitive by *round-tripping* the permute: interleave →
+    halves → rotate → halves → interleave. Round-tripping keeps the layout stable so the
+    inverse rotation on the attention output (called with ``-sin``) cleanly undoes the
+    forward rotation and downstream layers (``wo_a``/``wo_b``) see the same layout the
+    weights were trained with.
     """
     nope, rope = x[..., :-rope_head_dim], x[..., -rope_head_dim:]
+    leading = rope.shape[:-1]
+    half = rope_head_dim // 2
+    # interleave → halves
+    rope = rope.reshape(*leading, half, 2).transpose(-1, -2).reshape(*leading, rope_head_dim)
     rope, _ = apply_rotary_pos_emb(rope, torch.zeros_like(rope), cos, sin)
+    # halves → interleave
+    rope = rope.reshape(*leading, 2, half).transpose(-1, -2).reshape(*leading, rope_head_dim)
     return torch.cat([nope, rope], dim=-1)
+
+
+def _overlap_transform(tensor: torch.Tensor, head_dim: int, fill_value: float) -> torch.Tensor:
+    """Spread a packed ``[B, S//ratio, ratio, 2*head_dim]`` window grid into overlapping
+    ``[B, S//ratio, 2*ratio, head_dim]`` slots.
+
+    For each window the upstream V4 reference splits the second half of the projection
+    (last ``head_dim`` dims) into the *current* window's second half, and copies the
+    first half into the *next* window's first half — that's how compress_ratio=4 layers
+    get the overlap-window pooling that compress_ratio=128 layers don't have.
+    """
+    batch, n_windows, ratio, _ = tensor.shape
+    out = tensor.new_full((batch, n_windows, 2 * ratio, head_dim), fill_value)
+    out[:, :, ratio:, :] = tensor[:, :, :, head_dim:]
+    out[:, 1:, :ratio, :] = tensor[:, :-1, :, :head_dim]
+    return out
 
 
 def _pool_windows(kv: torch.Tensor, gate: torch.Tensor, ape: torch.Tensor, ratio: int, head_dim: int) -> torch.Tensor:
@@ -303,10 +331,18 @@ def _pool_windows(kv: torch.Tensor, gate: torch.Tensor, ape: torch.Tensor, ratio
 
     weights = softmax(gate + ape, dim=window)
     pooled  = sum(weights * kv, dim=window)
+
+    Layers with ``ratio == 4`` use the overlap form: the projections produce
+    ``2 * head_dim`` per token (a "current window" half and a "next window" half),
+    which :func:`_overlap_transform` re-arranges into ``2 * ratio`` slots of
+    ``head_dim`` before pooling.
     """
-    batch, length, _ = kv.shape
-    kv = kv.view(batch, length // ratio, ratio, head_dim)
-    gate = gate.view(batch, length // ratio, ratio, head_dim) + ape.to(gate.dtype)
+    batch, length, kv_dim = kv.shape
+    kv = kv.view(batch, length // ratio, ratio, kv_dim)
+    gate = gate.view(batch, length // ratio, ratio, kv_dim) + ape.to(gate.dtype)
+    if kv_dim == 2 * head_dim:
+        kv = _overlap_transform(kv, head_dim, 0.0)
+        gate = _overlap_transform(gate, head_dim, float("-inf"))
     return (kv * gate.softmax(dim=2)).sum(dim=2)
 
 
@@ -338,9 +374,13 @@ class DeepseekV4Indexer(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.index_topk = config.index_topk
         self.softmax_scale = self.head_dim**-0.5
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.ape = nn.Parameter(torch.empty(self.compress_ratio, self.head_dim))
+        # ``compress_ratio == 4`` is overlap-mode in the V4 reference: the kv/gate
+        # projections emit ``2 * head_dim`` so each token contributes to two
+        # neighbouring windows (see :func:`_overlap_transform`).
+        coff = 2
+        self.wkv = nn.Linear(config.hidden_size, coff * self.head_dim, bias=False)
+        self.wgate = nn.Linear(config.hidden_size, coff * self.head_dim, bias=False)
+        self.ape = nn.Parameter(torch.empty(self.compress_ratio, coff * self.head_dim))
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.wq_b = nn.Linear(config.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
@@ -369,7 +409,11 @@ class DeepseekV4Indexer(nn.Module):
             positions = _rope_pool_positions(
                 new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, new_pooled.shape[0]
             )
+            # ``rotary`` is a single shared module — under ``device_map="auto"`` accelerate
+            # parks it on its own GPU, so the cos/sin it returns may live elsewhere; pin
+            # them to ``new_pooled``'s device before the rope ops.
             cos, sin = rotary(new_pooled, positions)
+            cos, sin = cos.to(new_pooled.device), sin.to(new_pooled.device)
             new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
         pooled_kv = cache.update_pool(new_pooled, layer_idx, "indexer_state")
 
@@ -400,9 +444,14 @@ class DeepseekV4Compressor(nn.Module):
         self.compress_ratio = compress_ratio
         self.head_dim = head_dim
         self.rope_head_dim = config.qk_rope_head_dim
-        self.wkv = nn.Linear(config.hidden_size, head_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, head_dim, bias=False)
-        self.ape = nn.Parameter(torch.empty(compress_ratio, head_dim))
+        # Layers with ``compress_ratio == 4`` run in overlap mode, where each token's
+        # projection is split into two ``head_dim`` halves that land in adjacent
+        # windows. Disjoint-window layers (``compress_ratio == 128``) use plain
+        # ``head_dim`` projections.
+        coff = 2 if compress_ratio == 4 else 1
+        self.wkv = nn.Linear(config.hidden_size, coff * head_dim, bias=False)
+        self.wgate = nn.Linear(config.hidden_size, coff * head_dim, bias=False)
+        self.ape = nn.Parameter(torch.empty(compress_ratio, coff * head_dim))
         self.kv_norm = DeepseekV4RMSNorm(head_dim, eps=config.rms_norm_eps)
         self.indexer: DeepseekV4Indexer | None = DeepseekV4Indexer(config) if compress_ratio == 4 else None
 
@@ -430,7 +479,10 @@ class DeepseekV4Compressor(nn.Module):
         )
         new_pooled = self.kv_norm(_pool_windows(ready_kv, ready_gate, self.ape, self.compress_ratio, self.head_dim))
         positions = _rope_pool_positions(new_pooled.shape[1], pool_base, self.compress_ratio, new_pooled.device, batch)
+        # ``rotary`` lives on its own GPU under ``device_map="auto"``; bring its outputs
+        # back to the layer's device before applying the rope rotation.
         cos, sin = rotary(new_pooled, positions)
+        cos, sin = cos.to(new_pooled.device), sin.to(new_pooled.device)
         new_pooled = _apply_partial_rope(new_pooled.unsqueeze(1), cos, sin, self.rope_head_dim).squeeze(1)
         pooled = cache.update_pool(new_pooled, layer_idx, "compressor_state").unsqueeze(1)
 
@@ -525,10 +577,21 @@ class DeepseekV4Attention(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch, seq_len = hidden_states.shape[:2]
-        cos, sin = position_embeddings
+        # cos/sin are computed once at the model root and threaded through every layer;
+        # under ``device_map="auto"`` each layer lives on a different GPU, so move them
+        # to the local device before the rope ops (and reuse the tuple for the
+        # compressor below).
+        cos, sin = (t.to(hidden_states.device) for t in position_embeddings)
+        position_embeddings = (cos, sin)
+        cos_c, sin_c = (t.to(hidden_states.device) for t in position_embeddings_compress)
+        position_embeddings_compress = (cos_c, sin_c)
 
         q_residual = self.q_norm(self.wq_a(hidden_states))
         q = self.wq_b(q_residual).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # Per-head RMSNorm-style rescale (no learned weight) — the upstream V4 code does
+        # ``q *= rsqrt(mean(q**2) + eps)`` after the wq_b expansion, before rope. Skipping
+        # it leaves attention scores at the wrong scale and the model produces gibberish.
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.config.rms_norm_eps).to(q.dtype)
         kv = self.kv_norm(self.wkv(hidden_states)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
 
         q = _apply_partial_rope(q, cos, sin, self.rope_head_dim)
