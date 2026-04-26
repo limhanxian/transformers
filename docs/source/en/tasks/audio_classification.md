@@ -150,7 +150,7 @@ Now create a preprocessing function that:
 >>> def preprocess_function(examples):
 ...     audio_arrays = [x["array"] for x in examples["audio"]]
 ...     inputs = feature_extractor(
-...         audio_arrays, sampling_rate=feature_extractor.sampling_rate, max_length=16000, truncation=True
+...         audio_arrays, sampling_rate=feature_extractor.sampling_rate, padding=False
 ...     )
 ...     return inputs
 ```
